@@ -9,6 +9,7 @@ import sys
 import numpy as np
 from pydub import AudioSegment
 from tqdm.auto import tqdm as ProgressDisplay
+from pathlib import Path
 
 from manimlib.constants import FFMPEG_BIN
 from manimlib.logger import log
@@ -250,7 +251,7 @@ class SceneFileWriter(object):
                 self.add_sound_to_video()
             self.print_file_ready_message(self.get_movie_file_path())
         if self.save_last_frame:
-            self.scene.update_frame(ignore_skipping=True)
+            self.scene.update_frame(force_draw=True)
             self.save_final_image(self.scene.get_image())
         if self.should_open_file():
             self.open_file()
@@ -264,8 +265,8 @@ class SceneFileWriter(object):
         width, height = self.scene.camera.get_pixel_shape()
 
         vf_arg = 'vflip'
-        if self.pixel_format.startswith("yuv"):
-            vf_arg += f',eq=saturation={self.saturation}:gamma={self.gamma}'
+        # if self.pixel_format.startswith("yuv"):
+        vf_arg += f',eq=saturation={self.saturation}:gamma={self.gamma}'
 
         command = [
             FFMPEG_BIN,
@@ -299,15 +300,21 @@ class SceneFileWriter(object):
         self.video_codec = "libx264rgb"
         self.pixel_format = "rgb32"
 
+    def get_insert_file_path(self, index: int) -> Path:
+        movie_path = Path(self.get_movie_file_path())
+        scene_name = movie_path.stem
+        insert_dir = Path(movie_path.parent, "inserts")
+        guarantee_existence(str(insert_dir))
+        return Path(insert_dir, f"{scene_name}_{index}{movie_path.suffix}")
+
     def begin_insert(self):
         # Begin writing process
         self.write_to_movie = True
         self.init_output_directories()
-        movie_path = self.get_movie_file_path()
-        count = 0
-        while os.path.exists(name := movie_path.replace(".", f"_insert_{count}.")):
-            count += 1
-        self.inserted_file_path = name
+        index = 0
+        while (insert_path := self.get_insert_file_path(index)).exists():
+            index += 1
+        self.inserted_file_path = str(insert_path)
         self.open_movie_pipe(self.inserted_file_path)
 
     def end_insert(self):

@@ -213,20 +213,21 @@ class Scene(object):
         show_animation_progress: bool = False,
     ) -> None:
         if not self.preview:
-            return  # Embed is only relevant with a preview
+            # Embed is only relevant with a preview
+            return
         self.stop_skipping()
-        self.update_frame()
+        self.update_frame(force_draw=True)
         self.save_state()
         self.show_animation_progress = show_animation_progress
 
-        # Create embedded IPython terminal to be configured
-        shell = InteractiveShellEmbed.instance()
-
-        # Use the locals namespace of the caller
+        # Create embedded IPython terminal configured to have access to
+        # the local namespace of the caller
         caller_frame = inspect.currentframe().f_back
-        local_ns = dict(caller_frame.f_locals)
+        module = get_module(caller_frame.f_globals["__file__"])
+        shell = InteractiveShellEmbed(user_module=module)
 
-        # Add a few custom shortcuts
+        # Add a few custom shortcuts to that local namespace
+        local_ns = dict(caller_frame.f_locals)
         local_ns.update(
             play=self.play,
             wait=self.wait,
@@ -239,7 +240,12 @@ class Scene(object):
             i2g=self.i2g,
             i2m=self.i2m,
             checkpoint_paste=self.checkpoint_paste,
+            touch=lambda: shell.enable_gui("manim"),
+            notouch=lambda: shell.enable_gui(None),
         )
+
+        # Update the shell module with the caller's locals + shortcuts
+        module.__dict__.update(local_ns)
 
         # Enables gui interactions during the embed
         def inputhook(context):
@@ -252,28 +258,16 @@ class Scene(object):
         pt_inputhooks.register("manim", inputhook)
         shell.enable_gui("manim")
 
-        # This is hacky, but there's an issue with ipython which is that
-        # when you define lambda's or list comprehensions during a shell session,
-        # they are not aware of local variables in the surrounding scope. Because
-        # That comes up a fair bit during scene construction, to get around this,
-        # we (admittedly sketchily) update the global namespace to match the local
-        # namespace, since this is just a shell session anyway.
-        shell.events.register(
-            "pre_run_cell",
-            lambda: shell.user_global_ns.update(shell.user_ns)
-        )
-
         # Operation to run after each ipython command
-        def post_cell_func():
+        def post_cell_func(*args, **kwargs):
             if not self.is_window_closing():
-                self.update_frame(dt=0, ignore_skipping=True)
-            self.save_state()
+                self.update_frame(dt=0, force_draw=True)
 
         shell.events.register("post_run_cell", post_cell_func)
 
         # Flash border, and potentially play sound, on exceptions
         def custom_exc(shell, etype, evalue, tb, tb_offset=None):
-            # still show the error don't just swallow it
+            # Show the error don't just swallow it
             shell.showtraceback((etype, evalue, tb), tb_offset=tb_offset)
             if self.embed_error_sound:
                 os.system("printf '\a'")
@@ -287,13 +281,7 @@ class Scene(object):
         shell.magic(f"xmode {self.embed_exception_mode}")
 
         # Launch shell
-        shell(
-            local_ns=local_ns,
-            # Pretend like we're embeding in the caller function, not here
-            stack_depth=2,
-            # Specify that the present module is the caller's, not here
-            module=get_module(caller_frame.f_globals["__file__"])
-        )
+        shell()
 
         # End scene when exiting an embed
         if close_scene_on_exit:
@@ -311,28 +299,30 @@ class Scene(object):
         return image
 
     def show(self) -> None:
-        self.update_frame(ignore_skipping=True)
+        self.update_frame(force_draw=True)
         self.get_image().show()
 
-    def update_frame(self, dt: float = 0, ignore_skipping: bool = False) -> None:
+    def update_frame(self, dt: float = 0, force_draw: bool = False) -> None:
         self.increment_time(dt)
         self.update_mobjects(dt)
-        if self.skip_animations and not ignore_skipping:
+        if self.skip_animations and not force_draw:
             return
 
         if self.is_window_closing():
             raise EndScene()
 
-        if self.window:
-            self.window.clear()
+        if self.window and dt == 0 and not self.window.has_undrawn_event() and not force_draw:
+            # In this case, there's no need for new rendering, but we
+            # shoudl still listen for new events
+            self.window._window.dispatch_events()
+            return
+
         self.camera.capture(*self.render_groups)
 
-        if self.window:
-            self.window.swap_buffers()
+        if self.window and not self.skip_animations:
             vt = self.time - self.virtual_animation_start_time
             rt = time.time() - self.real_animation_start_time
-            if rt < vt:
-                self.update_frame(0)
+            time.sleep(max(vt - rt, 0))
 
     def emit_frame(self) -> None:
         if not self.skip_animations:
@@ -384,7 +374,7 @@ class Scene(object):
         """
         batches = batch_by_property(
             self.mobjects,
-            lambda m: str(type(m)) + str(m.get_uniforms())
+            lambda m: str(type(m)) + str(m.get_shader_wrapper(self.camera.ctx).get_id()) + str(m.z_index)
         )
 
         for group in self.render_groups:
@@ -411,6 +401,11 @@ class Scene(object):
         """
         self.remove(*new_mobjects)
         self.mobjects += new_mobjects
+
+        # Reorder based on z_index
+        id_to_scene_order = {id(m): idx for idx, m in enumerate(self.mobjects)}
+        self.mobjects.sort(key=lambda m: (m.z_index, id_to_scene_order[id(m)]))
+
         self.id_to_mobject_map.update({
             id(sm): sm
             for m in new_mobjects
@@ -528,6 +523,7 @@ class Scene(object):
 
     def stop_skipping(self) -> None:
         self.virtual_animation_start_time = self.time
+        self.real_animation_start_time = time.time()
         self.skip_animations = False
 
     # Methods associated with running animations
@@ -542,7 +538,7 @@ class Scene(object):
         if self.skip_animations and not override_skip_animations:
             return [run_time]
 
-        times = np.arange(0, run_time, 1 / self.camera.fps)
+        times = np.arange(0, run_time, 1 / self.camera.fps) + 1 / self.camera.fps
 
         self.file_writer.set_progress_display_description(sub_desc=desc)
 
@@ -594,8 +590,8 @@ class Scene(object):
             self.file_writer.begin_animation()
 
         if self.window:
-            self.real_animation_start_time = time.time()
             self.virtual_animation_start_time = self.time
+            self.real_animation_start_time = time.time()
 
     def post_play(self):
         if not self.skip_animations:
@@ -603,7 +599,7 @@ class Scene(object):
 
         if self.skip_animations and self.window is not None:
             # Show some quick frames along the way
-            self.update_frame(dt=0, ignore_skipping=True)
+            self.update_frame(dt=0, force_draw=True)
 
         self.num_plays += 1
 
@@ -788,14 +784,13 @@ class Scene(object):
             indent = " " * lines[0].index(lines[0].strip())
             pasted = "\n".join([
                 # Remove self from function signature
-                re.sub(r"self(,\s*)?", "", lines[0]), 
+                re.sub(r"self(,\s*)?", "", lines[0]),
                 *lines[1:],
                 # Attach to scene via self.func_name = func_name
                 f"{indent}self.{method_name} = {method_name}"
             ])
 
         # Keep track of skipping and progress bar status
-        prev_skipping = self.skip_animations
         self.skip_animations = skip
 
         prev_progress = self.show_animation_progress
@@ -811,7 +806,7 @@ class Scene(object):
             self.file_writer.end_insert()
             self.camera.use_window_fbo(True)
 
-        self.skip_animations = prev_skipping
+        self.stop_skipping()
         self.show_animation_progress = prev_progress
 
     def checkpoint(self, key: str):
@@ -863,7 +858,7 @@ class Scene(object):
         point: Vect3,
         d_point: Vect3
     ) -> None:
-        assert(self.window is not None)
+        assert self.window is not None
         self.mouse_point.move_to(point)
 
         event_data = {"point": point, "d_point": d_point}
@@ -1044,8 +1039,10 @@ class ThreeDScene(Scene):
     default_frame_orientation = (-30, 70)
     always_depth_test = True
 
-    def add(self, *mobjects: Mobject, set_depth_test: bool = True):
+    def add(self, *mobjects: Mobject, set_depth_test: bool = True, perp_stroke: bool = True):
         for mob in mobjects:
             if set_depth_test and not mob.is_fixed_in_frame() and self.always_depth_test:
                 mob.apply_depth_test()
+            if isinstance(mob, VMobject) and mob.has_stroke() and perp_stroke:
+                mob.set_flat_stroke(False)
         super().add(*mobjects)

@@ -198,7 +198,9 @@ def approx_smooth_quadratic_bezier_handles(
     another that would produce a parabola passing through P0, call it smooth_to_left,
     and use the midpoint between the two.
     """
-    if len(points) == 2:
+    if len(points) == 1:
+        return points[0]
+    elif len(points) == 2:
         return midpoint(*points)
     smooth_to_right, smooth_to_left = [
         0.25 * ps[0:-2] + ps[1:-1] - 0.25 * ps[2:]
@@ -223,7 +225,7 @@ def smooth_quadratic_path(anchors: Vect3Array) -> Vect3Array:
     if len(anchors) < 2:
         return anchors
     elif len(anchors) == 2:
-        return np.array([anchors[0], anchors.mean(1), anchors[2]])
+        return np.array([anchors[0], anchors.mean(0), anchors[1]])
 
     is_flat = (anchors[:, 2] == 0).all()
     if not is_flat:

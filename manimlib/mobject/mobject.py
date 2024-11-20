@@ -69,7 +69,7 @@ class Mobject(object):
     shader_folder: str = ""
     render_primitive: int = moderngl.TRIANGLE_STRIP
     # Must match in attributes of vert shader
-    shader_dtype: np.dtype = np.dtype([
+    data_dtype: np.dtype = np.dtype([
         ('point', np.float32, (3,)),
         ('rgba', np.float32, (4,)),
     ])
@@ -86,12 +86,14 @@ class Mobject(object):
         # If true, the mobject will not get rotated according to camera position
         is_fixed_in_frame: bool = False,
         depth_test: bool = False,
+        z_index: int = 0,
     ):
         self.color = color
         self.opacity = opacity
         self.shading = shading
         self.texture_paths = texture_paths
         self.depth_test = depth_test
+        self.z_index = z_index
 
         # Internal state
         self.submobjects: list[Mobject] = []
@@ -103,14 +105,13 @@ class Mobject(object):
         self.saved_state = None
         self.target = None
         self.bounding_box: Vect3Array = np.zeros((3, 3))
+        self.shader_wrapper: Optional[ShaderWrapper] = None
         self._is_animating: bool = False
         self._needs_new_bounding_box: bool = True
-        self._shaders_initialized: bool = False
         self._data_has_changed: bool = True
         self.shader_code_replacements: dict[str, str] = dict()
 
         self.init_data()
-        self._data_defaults = np.ones(1, dtype=self.data.dtype)
         self.init_uniforms()
         self.init_updaters()
         self.init_event_listners()
@@ -126,20 +127,22 @@ class Mobject(object):
         return self.__class__.__name__
 
     def __add__(self, other: Mobject) -> Mobject:
-        assert(isinstance(other, Mobject))
+        assert isinstance(other, Mobject)
         return self.get_group_class()(self, other)
 
     def __mul__(self, other: int) -> Mobject:
-        assert(isinstance(other, int))
+        assert isinstance(other, int)
         return self.replicate(other)
 
     def init_data(self, length: int = 0):
-        self.data = np.zeros(length, dtype=self.shader_dtype)
+        self.data = np.zeros(length, dtype=self.data_dtype)
+        self._data_defaults = np.ones(1, dtype=self.data.dtype)
 
     def init_uniforms(self):
         self.uniforms: UniformDict = {
             "is_fixed_in_frame": 0.0,
             "shading": np.array(self.shading, dtype=float),
+            "clip_plane": np.zeros(4),
         }
 
     def init_colors(self):
@@ -228,7 +231,7 @@ class Mobject(object):
     # Only these methods should directly affect points
     @affects_data
     def set_data(self, data: np.ndarray) -> Self:
-        assert(data.dtype == self.data.dtype)
+        assert data.dtype == self.data.dtype
         self.resize_points(len(data))
         self.data[:] = data
         return self
@@ -651,11 +654,9 @@ class Mobject(object):
         self.become(pickle.loads(data))
         return self
 
+    @stash_mobject_pointers
     def deepcopy(self) -> Self:
-        result = copy.deepcopy(self)
-        result._shaders_initialized = False
-        result._data_has_changed = True
-        return result
+        return copy.deepcopy(self)
 
     def copy(self, deep: bool = False) -> Self:
         if deep:
@@ -687,7 +688,7 @@ class Mobject(object):
         # won't have changed, just directly match.
         result.updaters = list(self.updaters)
         result._data_has_changed = True
-        result._shaders_initialized = False
+        result.shader_wrapper = None
 
         family = self.get_family()
         for attr, value in self.__dict__.items():
@@ -1245,6 +1246,10 @@ class Mobject(object):
     def set_z(self, z: float, direction: Vect3 = ORIGIN) -> Self:
         return self.set_coord(z, 2, direction)
 
+    def set_z_index(self, z_index: int) -> Self:
+        self.z_index = z_index
+        return self
+
     def space_out_submobjects(self, factor: float = 1.5, **kwargs) -> Self:
         self.scale(factor, **kwargs)
         for submob in self.submobjects:
@@ -1406,6 +1411,9 @@ class Mobject(object):
     def get_opacity(self) -> float:
         return float(self.data["rgba"][0, 3])
 
+    def get_opacities(self) -> float:
+        return self.data["rgba"][:, 3]
+
     def set_color_by_gradient(self, *colors: ManimColor) -> Self:
         if self.has_points():
             self.set_color(colors)
@@ -1446,9 +1454,11 @@ class Mobject(object):
         Makes parts bright where light gets reflected toward the camera
         """
         for mob in self.get_family(recurse):
+            shading = mob.uniforms["shading"]
             for i, value in enumerate([reflectiveness, gloss, shadow]):
                 if value is not None:
-                    mob.uniforms["shading"][i] = value
+                    shading[i] = value
+            mob.set_uniform(shading=shading, recurse=False)
         return self
 
     def get_reflectiveness(self) -> float:
@@ -1810,26 +1820,23 @@ class Mobject(object):
         if keys:
             self.note_changed_data()
         for key in keys:
-            func = path_func if key in self.pointlike_data_keys else interpolate
             md1 = mobject1.data[key]
             md2 = mobject2.data[key]
             if key in self.const_data_keys:
                 md1 = md1[0]
                 md2 = md2[0]
-            self.data[key] = func(md1, md2, alpha)
+            if key in self.pointlike_data_keys:
+                self.data[key] = path_func(md1, md2, alpha)
+            else:
+                self.data[key] = (1 - alpha) * md1 + alpha * md2
 
-        keys = [k for k in self.uniforms if k not in self.locked_uniform_keys]
-        for key in keys:
+        for key in self.uniforms:
+            if key in self.locked_uniform_keys:
+                continue
             if key not in mobject1.uniforms or key not in mobject2.uniforms:
                 continue
-            self.uniforms[key] = interpolate(
-                mobject1.uniforms[key],
-                mobject2.uniforms[key],
-                alpha
-            )
-        self.bounding_box[:] = path_func(
-            mobject1.bounding_box, mobject2.bounding_box, alpha
-        )
+            self.uniforms[key] = (1 - alpha) * mobject1.uniforms[key] + alpha * mobject2.uniforms[key]
+        self.bounding_box[:] = path_func(mobject1.bounding_box, mobject2.bounding_box, alpha)
         return self
 
     def pointwise_become_partial(self, mobject, a, b) -> Self:
@@ -1940,14 +1947,28 @@ class Mobject(object):
             mob.depth_test = False
         return self
 
+    def set_clip_plane(
+        self,
+        vect: Vect3 | None = None,
+        threshold: float | None = None
+    ) -> Self:
+        if vect is not None:
+            self.uniforms["clip_plane"][:3] = vect
+        if threshold is not None:
+            self.uniforms["clip_plane"][3] = threshold
+        return self
+
+    def deactivate_clip_plane(self) -> Self:
+        self.uniforms["clip_plane"][:] = 0
+        return self
+
     # Shader code manipulation
 
     @affects_data
     def replace_shader_code(self, old: str, new: str) -> Self:
-        self.shader_code_replacements[old] = new
-        self._shaders_initialized = False
-        for mob in self.get_ancestors():
-            mob._shaders_initialized = False
+        for mob in self.get_family():
+            mob.shader_code_replacements[old] = new
+            mob.shader_wrapper = None
         return self
 
     def set_color_by_code(self, glsl_code: str) -> Self:
@@ -1991,66 +2012,60 @@ class Mobject(object):
 
     # For shader data
 
-    def init_shader_data(self, ctx: Context):
-        self.shader_indices = np.zeros(0)
+    def init_shader_wrapper(self, ctx: Context):
         self.shader_wrapper = ShaderWrapper(
             ctx=ctx,
             vert_data=self.data,
             shader_folder=self.shader_folder,
+            mobject_uniforms=self.uniforms,
             texture_paths=self.texture_paths,
             depth_test=self.depth_test,
             render_primitive=self.render_primitive,
+            code_replacements=self.shader_code_replacements,
         )
 
     def refresh_shader_wrapper_id(self):
-        if self._shaders_initialized:
-            self.shader_wrapper.refresh_id()
+        for submob in self.get_family():
+            if submob.shader_wrapper is not None:
+                submob.shader_wrapper.depth_test = submob.depth_test
+                submob.shader_wrapper.refresh_id()
+        for mob in (self, *self.get_ancestors()):
+            mob._data_has_changed = True
         return self
 
     def get_shader_wrapper(self, ctx: Context) -> ShaderWrapper:
-        if not self._shaders_initialized:
-            self.init_shader_data(ctx)
-            self._shaders_initialized = True
-
-        self.shader_wrapper.vert_data = self.get_shader_data()
-        self.shader_wrapper.vert_indices = self.get_shader_vert_indices()
-        self.shader_wrapper.bind_to_mobject_uniforms(self.get_uniforms())
-        self.shader_wrapper.depth_test = self.depth_test
-        for old, new in self.shader_code_replacements.items():
-            self.shader_wrapper.replace_code(old, new)
+        if self.shader_wrapper is None:
+            self.init_shader_wrapper(ctx)
         return self.shader_wrapper
 
     def get_shader_wrapper_list(self, ctx: Context) -> list[ShaderWrapper]:
-        shader_wrappers = it.chain(
-            [self.get_shader_wrapper(ctx)],
-            *[sm.get_shader_wrapper_list(ctx) for sm in self.submobjects]
-        )
-        batches = batch_by_property(shader_wrappers, lambda sw: sw.get_id())
+        family = self.family_members_with_points()
+        batches = batch_by_property(family, lambda sm: sm.get_shader_wrapper(ctx).get_id())
 
         result = []
-        for wrapper_group, sid in batches:
-            shader_wrapper = wrapper_group[0]
-            if not shader_wrapper.is_valid():
-                continue
-            shader_wrapper.combine_with(*wrapper_group[1:])
-            if len(shader_wrapper.vert_data) > 0:
-                result.append(shader_wrapper)
+        for submobs, sid in batches:
+            shader_wrapper = submobs[0].shader_wrapper
+            data_list = [sm.get_shader_data() for sm in submobs]
+            shader_wrapper.read_in(data_list)
+            result.append(shader_wrapper)
         return result
 
-    def get_shader_data(self):
-        return self.data
+    def get_shader_data(self) -> np.ndarray:
+        indices = self.get_shader_vert_indices()
+        if indices is not None:
+            return self.data[indices]
+        else:
+            return self.data
 
     def get_uniforms(self):
         return self.uniforms
 
-    def get_shader_vert_indices(self):
-        return self.shader_indices
+    def get_shader_vert_indices(self) -> Optional[np.ndarray]:
+        return None
 
     def render(self, ctx: Context, camera_uniforms: dict):
         if self._data_has_changed:
             self.shader_wrappers = self.get_shader_wrapper_list(ctx)
-            for shader_wrapper in self.shader_wrappers:
-                shader_wrapper.generate_vao()
             self._data_has_changed = False
         for shader_wrapper in self.shader_wrappers:
             shader_wrapper.update_program_uniforms(camera_uniforms)

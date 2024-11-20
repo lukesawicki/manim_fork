@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -9,8 +10,10 @@ from pyrr import Matrix44
 from manimlib.constants import DEGREES, RADIANS
 from manimlib.constants import FRAME_SHAPE
 from manimlib.constants import DOWN, LEFT, ORIGIN, OUT, RIGHT, UP
+from manimlib.constants import PI
 from manimlib.mobject.mobject import Mobject
 from manimlib.utils.space_ops import normalize
+from manimlib.utils.simple_functions import clip
 
 from typing import TYPE_CHECKING
 
@@ -26,15 +29,18 @@ class CameraFrame(Mobject):
         # Field of view in the y direction
         fovy: float = 45 * DEGREES,
         euler_axes: str = "zxz",
+        # This keeps it ordered first in a scene
+        z_index=-1,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        super().__init__(z_index=z_index, **kwargs)
 
         self.uniforms["orientation"] = Rotation.identity().as_quat()
         self.uniforms["fovy"] = fovy
 
         self.default_orientation = Rotation.identity()
         self.view_matrix = np.identity(4)
+        self.id4x4 = np.identity(4)
         self.camera_location = OUT  # This will be updated by set_points
         self.euler_axes = euler_axes
 
@@ -62,9 +68,20 @@ class CameraFrame(Mobject):
 
     def get_euler_angles(self) -> np.ndarray:
         orientation = self.get_orientation()
-        if all(orientation.as_quat() == [0, 0, 0, 1]):
+        if np.isclose(orientation.as_quat(), [0, 0, 0, 1]).all():
             return np.zeros(3)
-        return orientation.as_euler(self.euler_axes)[::-1]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', UserWarning)  # Ignore UserWarnings
+            angles = orientation.as_euler(self.euler_axes)[::-1]
+        # Handle Gimble lock case
+        if self.euler_axes == "zxz":
+            if np.isclose(angles[1], 0, atol=1e-2):
+                angles[0] = angles[0] + angles[2]
+                angles[2] = 0
+            if np.isclose(angles[1], PI, atol=1e-2):
+                angles[0] = angles[0] - angles[2]
+                angles[2] = 0
+        return angles
 
     def get_theta(self):
         return self.get_euler_angles()[0]
@@ -87,17 +104,15 @@ class CameraFrame(Mobject):
         into the camera's internal coordinate system
         """
         if self._data_has_changed:
-            shift = np.identity(4)
-            rotation = np.identity(4)
-            scale_mat = np.identity(4)
+            shift = self.id4x4.copy()
+            rotation = self.id4x4.copy()
 
+            scale = self.get_scale()
             shift[:3, 3] = -self.get_center()
             rotation[:3, :3] = self.get_inverse_camera_rotation_matrix()
-            scale = self.get_scale()
+            np.dot(rotation, shift, out=self.view_matrix)
             if scale > 0:
-                scale_mat[:3, :3] /= self.get_scale()
-
-            self.view_matrix = np.dot(scale_mat, np.dot(rotation, shift))
+                self.view_matrix[:3, :4] /= scale
 
         return self.view_matrix
 
@@ -134,16 +149,22 @@ class CameraFrame(Mobject):
 
     def increment_euler_angles(
         self,
-        dtheta: float | None = None,
-        dphi: float | None = None,
-        dgamma: float | None = None,
+        dtheta: float = 0,
+        dphi: float = 0,
+        dgamma: float = 0,
         units: float = RADIANS
     ):
         angles = self.get_euler_angles()
-        for i, value in enumerate([dtheta, dphi, dgamma]):
-            if value is not None:
-                angles[i] += value * units
-        self.set_euler_angles(*angles)
+        new_angles = angles + np.array([dtheta, dphi, dgamma]) * units
+
+        # Limit range for phi
+        if self.euler_axes == "zxz":
+            new_angles[1] = clip(new_angles[1], 0, PI)
+        elif self.euler_axes == "zxy":
+            new_angles[1] = clip(new_angles[1], -PI / 2, PI / 2)
+
+        new_rot = Rotation.from_euler(self.euler_axes, new_angles[::-1])
+        self.set_orientation(new_rot)
         return self
 
     def set_euler_axes(self, seq: str):
